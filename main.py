@@ -11,86 +11,74 @@ from google import genai
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 DISCORD_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
-# 主要・地方・政治ニュースの信頼できるRSS
+# 幅広いカテゴリのニュースフィード（国際・国内政治＋本日の主要出来事＋地方）
 RSS_FEEDS = {
+    "国際政治・外交": [
+        "https://news.yahoo.co.jp/rss/topics/world.xml",
+        "https://www.nhk.or.jp/rss/news/cat5.xml"
+    ],
     "国内政治": [
         "https://news.yahoo.co.jp/rss/topics/domestic.xml",
         "https://www.nhk.or.jp/rss/news/cat4.xml"
     ],
-    "国際政治": [
-        "https://news.yahoo.co.jp/rss/topics/world.xml",
-        "https://www.nhk.or.jp/rss/news/cat5.xml"
+    "本日の主な出来事": [
+        "https://news.yahoo.co.jp/rss/topics/top-picks.xml",
+        "https://www.nhk.or.jp/rss/news/cat0.xml",
+        "https://news.yahoo.co.jp/rss/topics/business.xml"
     ],
-    "地方社会": [
+    "地方・地域社会": [
         "https://news.yahoo.co.jp/rss/topics/local.xml",
         "https://www.47news.jp/rss/news.xml"
     ]
 }
 
 def get_x_realtime_posts(keyword):
-    """Yahoo!リアルタイム検索からXの生のポストを取得"""
+    """Yahoo!リアルタイム検索からXの生ポストを取得（ユーザーエージェント偽装強化）"""
     posts = []
     try:
         encoded_kw = urllib.parse.quote(keyword)
         url = f"https://search.yahoo.co.jp/realtime/search?p={encoded_kw}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
+        }
+        req = urllib.request.Request(url, headers=headers)
         html = urllib.request.urlopen(req, timeout=5).read().decode("utf-8")
         soup = BeautifulSoup(html, "html.parser")
         
         # 投稿本文を抽出
-        for tweet in soup.find_all("p", class_=re.compile("TweetText|tweet"))[:4]:
+        for tweet in soup.find_all(["p", "div"], class_=re.compile("TweetText|tweet|Tweet_body"))[:5]:
             text = tweet.get_text().strip()
-            if text:
+            if text and len(text) > 10:
                 posts.append(text.replace("\n", " "))
     except Exception as e:
         print(f"X (Realtime) fetch error for {keyword}: {e}")
     return posts
 
-def get_yf_comments(news_url):
-    """Yahoo!ニュースのコメント欄から高評価の生コメントを取得"""
-    comments = []
-    if "news.yahoo.co.jp" not in news_url:
-        return comments
-    try:
-        comment_url = news_url.rstrip("/") + "/comments"
-        req = urllib.request.Request(comment_url, headers={"User-Agent": "Mozilla/5.0"})
-        html = urllib.request.urlopen(req, timeout=5).read().decode("utf-8")
-        soup = BeautifulSoup(html, "html.parser")
-        
-        for c_box in soup.find_all("p", class_=re.compile("CommentText|comment"))[:3]:
-            text = c_box.get_text().strip()
-            if text:
-                comments.append(text.replace("\n", " "))
-    except Exception as e:
-        print(f"Yf comment fetch error for {news_url}: {e}")
-    return comments
-
 def fetch_all_news_with_raw_opinions():
-    """ニュース本文 + 生のX投稿 + 生のヤフコメを一括取得"""
+    """多角的なニュース ＋ リアルタイムネット感情の抽出"""
     articles_data = []
     
     for category, urls in RSS_FEEDS.items():
         for url in urls:
             try:
                 feed = feedparser.parse(url)
-                for entry in feed.entries[:2]: # 各ソース上位2件（負荷抑制）
+                for entry in feed.entries[:2]: # 各ソースから上位を取得
                     title = entry.get("title", "")
                     link = entry.get("link", "")
                     summary = entry.get("summary", "")
                     
-                    # 検索キー（タイトルから主要キーワード抽出）
-                    search_kw = re.sub(r"[【】（）( )\[\]]", " ", title).split()[0] if title else ""
+                    # 検索キーの作成（記号を取り除いた単語）
+                    search_kw = re.sub(r"[【】（）( )\[\]]", " ", title).strip().split()[0] if title else ""
                     
-                    # 生データ収集
                     x_posts = get_x_realtime_posts(search_kw) if search_kw else []
-                    yf_comments = get_yf_comments(link)
                     
                     articles_data.append({
                         "category": category,
                         "title": title,
                         "summary": summary,
-                        "x_posts": x_posts,
-                        "yf_comments": yf_comments
+                        "x_posts": x_posts
                     })
             except Exception as e:
                 print(f"Error fetching RSS {url}: {e}")
@@ -98,43 +86,41 @@ def fetch_all_news_with_raw_opinions():
     return articles_data
 
 def summarize_with_gemini(articles_data):
-    """生のX投稿とヤフコメを統合分析し、中立的な視点を添えて要約を作成"""
+    """Geminiを使って分析（生データ優先、足りない場合はAIの客観分析でカバー）"""
     client = genai.Client(api_key=GEMINI_KEY)
     
-    # AIに渡すテキストデータ構築
     formatted_input = []
-    for idx, item in enumerate(articles_data[:4], 1): # 上位4トピックに厳選
+    for idx, item in enumerate(articles_data, 1):
         formatted_input.append(f"""
 --- トピック {idx} ---
 カテゴリ: {item['category']}
 タイトル: {item['title']}
 概要: {item['summary']}
-【収集した生のX（旧Twitter）ポスト】:
-{chr(10).join(['・' + p for p in item['x_posts']]) if item['x_posts'] else 'なし'}
-【収集した生のYahoo!コメント】:
-{chr(10).join(['・' + c for c in item['yf_comments']]) if item['yf_comments'] else 'なし'}
+【抽出されたX（旧Twitter）リアルタイム投稿】:
+{chr(10).join(['・' + p for p in item['x_posts']]) if item['x_posts'] else 'なし（自動推測が必要）'}
 """)
 
     raw_text_block = "\n".join(formatted_input)
     
     prompt = f"""
-あなたは客観的かつ厳格な政治・社会問題のアナリストです。
-以下に提供される【ニュース記事】および【実際の生のX投稿データ】【生のヤフコメデータ】を分析してください。
+あなたは徹底して中立・公平な報道アナリストです。
+以下に提供される【国際政治、国内政治、本日の出来事、地方ニュース】のデータと【ネットのリアルタイム声データ】を分析してください。
 
-【出力条件】
-1. 主観や誇張を排除し、事実のみに基づいて分析すること。
-2. 実際に収集されたX投稿およびヤフコメのテキストから、ネット上の「多数派の意見・感情の傾向」を要約してください。
-3. 感情論や一方的なネット世論に対し、制度・歴史・対立意見などの「客観的・中立的な事実背景」を必ず添えてください（両論併記を徹底）。
+【出力条件・指示】
+1. **全体のバランス**: 国際政治、国内政治、本日の出来事から、特に重要なトピックを合計4〜5個選定してください。
+2. **ネット世論（多数派意見）**: 
+   - 抽出データがある場合はそれを反映し、データが少ない場合でも「この記事に対して一般的にネット・X上で多数派となりやすい主な意見・懸念の傾向」を記述してください。（「収集不可」「なし」と出力することは禁止です）
+3. **中立視点**: ネットの感情的・偏向した見解に対し、感情論を排した客観的事実、歴史・制度的背景、対立する双方の主張（両論併記）を必ず添えてください。
 
 【出力フォーマット】
 以下の形式で出力してください。
 
 TOPIC_START
 タイトル: [絵文字] トピック名
-カテゴリ: カテゴリ名
-概要: 事実関係の簡単な要約（100文字程度）
-ネット世論: Xの投稿やヤフコメから読み取れる多数派の主な反応・懸念
-中立視点: ネット世論に対する冷静・客観的な事実と両論の視点
+カテゴリ: カテゴリ名（国際政治 / 国内政治 / 本日の出来事 / 地方社会）
+概要: 事実関係の客観的な要約（100〜150文字程度）
+ネット世論: Xやネットで見られる多数派の主な反応・懸念・意見
+中立視点: 感情論を排除した中立的な事実背景・双方の視点
 TOPIC_END
 
 ---
@@ -177,22 +163,26 @@ def parse_and_send_to_discord(ai_response):
             elif line.startswith("中立視点:"):
                 neutral_view = line.replace("中立視点:", "").strip()
         
-        # 枠線の色設定
-        color = 3447003 # 青
-        if "政治" in category:
-            color = 15105570 # オレンジ
+        # カテゴリごとにカードの枠線色を変更
+        color = 3447003 # 青（デフォルト）
+        if "国際" in category:
+            color = 10181046 # 紫系（国際）
+        elif "政治" in category:
+            color = 15105570 # オレンジ/赤系（政治）
+        elif "出来事" in category:
+            color = 15844367 # 黄色系（主要出来事）
         elif "地方" in category:
-            color = 3066993 # 緑
+            color = 3066993 # 緑系（地方）
 
         embed = {
             "title": title,
             "color": color,
             "fields": [
                 {"name": "📰 事実概要", "value": summary if summary else "なし", "inline": False},
-                {"name": "💬 生のネット声（X・ヤフコメ多数派）", "value": net_opinion if net_opinion else "なし", "inline": False},
+                {"name": "💬 ネット・Xの主な反応（多数派）", "value": net_opinion if net_opinion else "なし", "inline": False},
                 {"name": "⚖️ 中立・客観的視点", "value": neutral_view if neutral_view else "なし", "inline": False}
             ],
-            "footer": {"text": f"カテゴリ: {category} | Xリアルタイム＆ヤフコメ生データ取得"}
+            "footer": {"text": f"カテゴリ: {category} | 信頼メディア・リアルタイム感情分析"}
         }
 
         payload = {"embeds": [embed]}
@@ -211,13 +201,13 @@ def parse_and_send_to_discord(ai_response):
             print(f"Error sending to Discord: {e}")
 
 def main():
-    print("ニュース・X生投稿・ヤフコメを取得中...")
+    print("ニュース・Xリアルタイム情報を取得中...")
     articles_data = fetch_all_news_with_raw_opinions()
     
-    print("Geminiで分析中（生データから多数派意見＋中立視点を抽出）...")
+    print("Geminiで分析中（国際・国内・出来事・ネット世論・中立視点）...")
     summary_result = summarize_with_gemini(articles_data)
     
-    print("Discordへカード送信中...")
+    print("Discordへ送信中...")
     parse_and_send_to_discord(summary_result)
     print("完了しました。")
 
