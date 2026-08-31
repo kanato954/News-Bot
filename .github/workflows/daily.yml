@@ -16,7 +16,7 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: |
-          pip install feedparser google-genai
+          pip install feedparser google-genai beautifulsoup4
       - name: Run script
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
